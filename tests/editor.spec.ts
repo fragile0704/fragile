@@ -2,7 +2,7 @@ import { test, expect, type Page } from '@playwright/test'
 import { readFile } from 'node:fs/promises'
 
 async function fresh(page: Page, width = 240, height = 240) {
-  await page.goto('/')
+  await page.goto('./')
   await page.getByRole('button', { name: '新建画布', exact: true }).click()
   const dialog = page.getByRole('dialog')
   await dialog.getByLabel('作品名称').fill('验收画布')

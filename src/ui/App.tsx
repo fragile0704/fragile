@@ -113,7 +113,7 @@ export function App({
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <img src="/atelier.svg" alt="" />
+          <img src={import.meta.env.BASE_URL + 'atelier.svg'} alt="" />
           <span>Atelier</span>
         </div>
         <i className="vr" />
