@@ -523,3 +523,126 @@ test('落笔后立即刷新保留最后一笔', async ({ page }) => {
   await expect(page.locator('.document-tab')).toContainText('验收画布')
   await alpha(page, 100, 110, 255)
 })
+
+test('普通滚轮连续缩放，在每一帧保持指针锚点并遵守上下限', async ({ page }) => {
+  await fresh(page)
+  await page.locator('.zoom-label').click()
+  const anchor = await position(page, 146, 103)
+  const samples = await page.evaluate(async ({ x, y }) => {
+    const stage = document.querySelector('.stage')!
+    const board = document.querySelector<HTMLCanvasElement>(
+      '[data-testid=artboard]',
+    )!
+    const event = new WheelEvent('wheel', {
+      clientX: x,
+      clientY: y,
+      deltaY: -240,
+      cancelable: true,
+    })
+    // Chromium reports integer wheel coordinates even on a fractional stage origin.
+    const measure = () => {
+      const r = board.getBoundingClientRect()
+      return [
+        r.width / board.width,
+        ((event.clientX - r.x) * board.width) / r.width,
+        ((event.clientY - r.y) * board.height) / r.height,
+      ]
+    }
+    const frames = [measure()]
+    stage.dispatchEvent(event)
+    for (let i = 0; i < 30; i++) {
+      await new Promise(requestAnimationFrame)
+      frames.push(measure())
+    }
+    return frames
+  }, anchor)
+  expect(new Set(samples.map((f) => f[0])).size).toBeGreaterThan(2)
+  expect(samples.at(-1)![0]).toBeCloseTo(Math.exp(0.6), 3)
+  for (const [, x, y] of samples) {
+    expect(Math.abs(x - samples[0][1])).toBeLessThan(0.02)
+    expect(Math.abs(y - samples[0][2])).toBeLessThan(0.02)
+  }
+  await page.mouse.move(anchor.x, anchor.y)
+  for (const [delta, percent] of [
+    [-4000, 3200],
+    [8000, 5],
+  ]) {
+    await page.mouse.wheel(0, delta)
+    await expect(page.locator('.zoom-label')).toHaveText(percent + '%')
+    await expect
+      .poll(async () =>
+        Math.round(
+          ((await page.getByTestId('artboard').boundingBox())!.width * 10000) /
+            240,
+        ),
+      )
+      .toBe(percent * 100)
+  }
+  await expect(
+    page.getByRole('button', { name: '撤销 (Ctrl+Z)' }),
+  ).toBeDisabled()
+})
+
+test.describe('触屏视图导航', () => {
+  test.use({ hasTouch: true })
+  test('双指同时缩放平移，保留原笔迹、图层、选区和历史，松手后可继续绘制', async ({
+    page,
+    context,
+  }) => {
+    await fresh(page)
+    await page.locator('.zoom-label').click()
+    await stroke(page, 50, 60)
+    await page.getByRole('button', { name: '新建图层', exact: true }).click()
+    await page.keyboard.press('m')
+    await stroke(page, 80, 80, 155, 155)
+    const cdp = await context.newCDPSession(page)
+    const center = await position(page, 120, 120)
+    const send = (
+      type: 'touchStart' | 'touchMove' | 'touchEnd',
+      coords: number[][],
+    ) =>
+      cdp.send('Input.dispatchTouchEvent', {
+        type,
+        touchPoints: coords.map(([dx, dy], id) => ({
+          id: id + 1,
+          x: center.x + dx,
+          y: center.y + dy,
+        })),
+      })
+    await send('touchStart', [
+      [-30, 0],
+      [30, 0],
+    ])
+    await send('touchMove', [
+      [-40, 20],
+      [80, 20],
+    ])
+    await send('touchEnd', [])
+    await expect(page.locator('.zoom-label')).toHaveText('200%')
+    const mapped = await position(page, 120, 120)
+    expect(mapped.x).toBeCloseTo(center.x + 20, 0)
+    expect(mapped.y).toBeCloseTo(center.y + 20, 0)
+    await page.keyboard.press('b')
+    await send('touchStart', [
+      [-30, 0],
+      [30, 0],
+    ])
+    await send('touchMove', [
+      [-10, 10],
+      [50, 10],
+    ])
+    await send('touchEnd', [])
+    const moved = await position(page, 120, 120)
+    expect(moved.x).toBeCloseTo(mapped.x + 20, 0)
+    expect(moved.y).toBeCloseTo(mapped.y + 10, 0)
+    await alpha(page, 95, 110, 0)
+    await stroke(page, 65, 110, 136, 110)
+    await alpha(page, 69, 110, 0)
+    await alpha(page, 125, 110, 255)
+    await page.keyboard.press('Control+z')
+    await alpha(page, 125, 110, 0)
+    await page.keyboard.press('Control+z')
+    await expect(page.locator('.layer-row')).toHaveCount(1)
+    await alpha(page, 50, 60, 255)
+  })
+})

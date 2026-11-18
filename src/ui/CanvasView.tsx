@@ -1,3 +1,6 @@
+import { flushSync } from 'react-dom'
+import { anchoredView, limitZoom } from '../engine/view'
+import { stagePosition, TouchNavigation, wheelNavigation } from './navigation'
 import type { Bounds } from '../engine/bounds'
 import {
   useEffect,
@@ -16,13 +19,21 @@ import {
   PanelRightOpen,
 } from 'lucide-react'
 import { type Workspace } from '../state/workspace'
-import { clamp, context, surface, type Point, type Tool } from '../engine/types'
+import {
+  clamp,
+  context,
+  surface,
+  type Point,
+  type Tool,
+  type Selection,
+} from '../engine/types'
 import { polygon } from '../engine/editor'
 import { composite } from '../engine/layers'
 import { IconButton, toolInfo } from './common'
 type Capture = {
   id: number
   tool: Tool
+  selection: Selection
   start: Point
   last: Point
   screenX: number
@@ -45,18 +56,18 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
   current.current = s
   const cap = useRef<Capture | null>(null),
     space = useRef(false)
+  const redrawSelection = useRef<() => void>(() => {})
+  const touches = useRef(new TouchNavigation())
   function fit() {
     const node = stage.current
     if (!node) return
     const w = node.clientWidth,
       h = node.clientHeight
-    const zoom = clamp(
+    const zoom = limitZoom(
       Math.min(
         (w - Math.min(64, w * 0.12)) / current.current.editor.doc.width,
         (h - 78) / current.current.editor.doc.height,
       ),
-      0.1,
-      8,
     )
     current.current.setView({ zoom, x: 0, y: 0, angle: 0, flip: false })
   }
@@ -69,9 +80,8 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
   useEffect(() => {
     const scratch = surface(doc.width, doc.height)
     let hadSelection = false
-    const draw = (dirty?: Bounds) => {
-      if (!canvas.current || !overlay.current) return
-      composite(editor.doc, canvas.current, scratch, dirty)
+    redrawSelection.current = () => {
+      if (!overlay.current) return
       const selection = editor.selection
       if (!selection && !hadSelection) return
       hadSelection = !!selection
@@ -89,11 +99,18 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
         ctx.restore()
       }
     }
+    const draw = (dirty?: Bounds) => {
+      if (!canvas.current) return
+      composite(editor.doc, canvas.current, scratch, dirty)
+      redrawSelection.current()
+    }
     draw()
     return editor.subscribePaint(draw)
   }, [editor, doc.width, doc.height])
   useLayoutEffect(() => {
-    if (editor.selection) editor.repaint()
+    redrawSelection.current()
+  }, [v.zoom])
+  useLayoutEffect(() => {
     const node = stage.current
     if (!node) return
     const dpr = window.devicePixelRatio || 1
@@ -101,10 +118,11 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
       const r = (horizontal ? topRuler : leftRuler).current!
       const w = r.clientWidth,
         h = r.clientHeight
-      r.width = Math.round(w * dpr)
-      r.height = Math.round(h * dpr)
+      if (r.width !== Math.round(w * dpr)) r.width = Math.round(w * dpr)
+      if (r.height !== Math.round(h * dpr)) r.height = Math.round(h * dpr)
       const ctx = context(r)
-      ctx.scale(dpr, dpr)
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      ctx.clearRect(0, 0, w, h)
       const length = horizontal ? w : h,
         center = horizontal ? w / 2 + v.x : h / 2 - 18 + v.y
       const origin = horizontal ? doc.width / 2 : doc.height / 2
@@ -113,11 +131,10 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
           (n) => n * v.zoom >= 43,
         ) ?? 1000
       const sign = horizontal && v.flip ? -1 : 1
-      const first =
-        Math.floor(
-          (origin - length / v.zoom - Math.abs(center) / v.zoom) / spacing,
-        ) * spacing
-      const last = origin + length / v.zoom + Math.abs(center) / v.zoom
+      const edgeA = origin - center / (v.zoom * sign)
+      const edgeB = origin + (length - center) / (v.zoom * sign)
+      const first = Math.floor(Math.min(edgeA, edgeB) / spacing) * spacing
+      const last = Math.max(edgeA, edgeB) + spacing
       ctx.font = '9px monospace'
       ctx.fillStyle = '#83837f'
       ctx.strokeStyle = '#50514e'
@@ -149,30 +166,12 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
   }, [v, doc.width, doc.height, editor])
   useEffect(() => {
     const node = stage.current!
-    function wheel(e: WheelEvent) {
-      e.preventDefault()
-      if (cap.current) return
-      const s = current.current
-      if (e.ctrlKey || e.metaKey) {
-        const r = node.getBoundingClientRect(),
-          x = e.clientX - r.left - r.width / 2,
-          y = e.clientY - r.top - r.height / 2 + 18
-        s.setView((v) => {
-          const z = clamp(v.zoom * Math.exp(-e.deltaY * 0.0025), 0.1, 8)
-          return {
-            ...v,
-            zoom: z,
-            x: x - ((x - v.x) * z) / v.zoom,
-            y: y - ((y - v.y) * z) / v.zoom,
-          }
-        })
-      } else
-        s.setView((v) => ({
-          ...v,
-          x: v.x - e.deltaX - (e.shiftKey ? e.deltaY : 0),
-          y: v.y - (e.shiftKey ? 0 : e.deltaY),
-        }))
-    }
+    const detachWheel = wheelNavigation(
+      node,
+      () => current.current.view,
+      (view) => flushSync(() => current.current.setView(view)),
+      () => !!cap.current || touches.current.tracking,
+    )
     function down(e: KeyboardEvent) {
       if (
         e.code === 'Space' &&
@@ -194,16 +193,18 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
     }
     function reset() {
       space.current = false
+      touches.current.reset()
+      if (cap.current?.tool === 'select' || cap.current?.tool === 'lasso')
+        editor.setSelection(cap.current.selection)
       cap.current = null
       editor.cancel()
       node.classList.remove('panning')
     }
-    node.addEventListener('wheel', wheel, { passive: false })
     window.addEventListener('keydown', down)
     window.addEventListener('keyup', up)
     window.addEventListener('blur', reset)
     return () => {
-      node.removeEventListener('wheel', wheel)
+      detachWheel()
       window.removeEventListener('keydown', down)
       window.removeEventListener('keyup', up)
       window.removeEventListener('blur', reset)
@@ -215,9 +216,9 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
     pressure: number
     pointerType: string
   }): Point {
-    const r = stage.current!.getBoundingClientRect(),
-      dx = e.clientX - r.left - r.width / 2 - v.x,
-      dy = e.clientY - r.top - r.height / 2 + 18 - v.y
+    const screen = stagePosition(stage.current!, e.clientX, e.clientY)
+    const dx = screen.x - v.x,
+      dy = screen.y - v.y
     const a = (v.angle * Math.PI) / 180,
       cos = Math.cos(a),
       sin = Math.sin(a)
@@ -227,22 +228,21 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
       p: e.pointerType === 'pen' ? clamp(e.pressure || 0.08, 0.03, 1) : 1,
     }
   }
-  function start(e: RPointer<HTMLDivElement>) {
-    if (cap.current || e.button > 1) return
-    e.preventDefault()
-    e.currentTarget.focus({ preventScroll: true })
-    const p = point(e),
-      tool = e.button === 1 || space.current ? 'hand' : s.tool
-    if (
-      tool !== 'hand' &&
-      (p.x < 0 || p.y < 0 || p.x >= doc.width || p.y >= doc.height)
-    )
-      return
+  function applyTap(tool: Tool, e: RPointer<HTMLDivElement>, p: Point) {
     if (tool === 'zoom') {
-      s.zoom(e.altKey ? 0.8 : 1.25)
+      const anchor = stagePosition(e.currentTarget, e.clientX, e.clientY)
+      s.setView((v) =>
+        anchoredView(v, v.zoom * (e.altKey ? 0.8 : 1.25), anchor),
+      )
       return
     }
-    if (tool === 'pick') {
+    if (
+      tool === 'pick' &&
+      p.x >= 0 &&
+      p.y >= 0 &&
+      p.x < doc.width &&
+      p.y < doc.height
+    ) {
       const [r, g, b, a] = context(canvas.current!).getImageData(
         Math.floor(p.x),
         Math.floor(p.y),
@@ -257,7 +257,47 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
       }
       return
     }
-    if (tool === 'select' || tool === 'lasso') editor.setSelection(null)
+  }
+  function start(e: RPointer<HTMLDivElement>) {
+    if (e.button > 1) return
+    if (e.pointerType === 'touch') {
+      if (cap.current && !touches.current.tracking) return
+      touches.current.start(
+        e.pointerId,
+        stagePosition(e.currentTarget, e.clientX, e.clientY),
+        v,
+      )
+      e.currentTarget.setPointerCapture(e.pointerId)
+      if (touches.current.active) {
+        e.preventDefault()
+        const previous = cap.current
+        if (previous) {
+          editor.cancel()
+          if (previous.tool === 'select' || previous.tool === 'lasso')
+            editor.setSelection(previous.selection)
+          cap.current = null
+        }
+        cursor.current!.style.display = 'none'
+        return
+      }
+    } else if (touches.current.tracking) return
+    if (cap.current) return
+    e.preventDefault()
+    e.currentTarget.focus({ preventScroll: true })
+    const p = point(e),
+      tool = e.button === 1 || space.current ? 'hand' : s.tool
+    if (
+      tool !== 'hand' &&
+      (p.x < 0 || p.y < 0 || p.x >= doc.width || p.y >= doc.height)
+    )
+      return
+    const selection = editor.selection
+    if (tool === 'pick' || tool === 'zoom') {
+      if (e.pointerType !== 'touch') {
+        applyTap(tool, e, p)
+        return
+      }
+    } else if (tool === 'select' || tool === 'lasso') editor.setSelection(null)
     else if (
       tool !== 'hand' &&
       !editor.start(tool, p, s.brush, s.color, s.tolerance, s.grow, s.sampleAll)
@@ -275,6 +315,7 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
     cap.current = {
       id: e.pointerId,
       tool,
+      selection,
       start: p,
       last: p,
       screenX: e.clientX,
@@ -294,6 +335,16 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
       )
   }
   function move(e: RPointer<HTMLDivElement>) {
+    if (e.pointerType === 'touch') {
+      const view = touches.current.move(
+        e.pointerId,
+        stagePosition(e.currentTarget, e.clientX, e.clientY),
+      )
+      if (view) {
+        s.setView(view)
+        return
+      }
+    }
     const p = point(e),
       r = e.currentTarget.getBoundingClientRect(),
       ring = cursor.current!
@@ -328,12 +379,16 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
     g.last = p
   }
   function end(e: RPointer<HTMLDivElement>, cancel = false) {
+    if (e.pointerType === 'touch') touches.current.end(e.pointerId)
     const g = cap.current
     if (!g || g.id !== e.pointerId) return
     cap.current = null
     if (cancel) {
       editor.cancel()
-      if (g.tool === 'select' || g.tool === 'lasso') editor.setSelection(null)
+      if (g.tool === 'select' || g.tool === 'lasso')
+        editor.setSelection(g.selection)
+    } else if (g.tool === 'pick' || g.tool === 'zoom') {
+      applyTap(g.tool, e, point(e))
     } else if (g.tool === 'select' || g.tool === 'lasso') {
       const p = point(e)
       updateSelection(g, p)
@@ -383,7 +438,7 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
           onPointerUp={(endEvent) => end(endEvent)}
           onPointerCancel={(ev) => end(ev, true)}
           onLostPointerCapture={(ev) => {
-            if (cap.current?.id === ev.pointerId) end(ev, true)
+            end(ev, true)
           }}
           onContextMenu={(e) => e.preventDefault()}
           onPointerLeave={() => {

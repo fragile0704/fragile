@@ -192,7 +192,8 @@ export function Dialogs({
           {[
             ...Object.values(toolInfo).map(([label, , key]) => [label, key]),
             ['平移画布', 'Space + 拖动'],
-            ['缩放画布', 'Ctrl + 滚轮'],
+            ['缩放画布', '滚轮（可按 Ctrl）'],
+            ['双指缩放与平移', '捏合或拖动'],
             ['撤销 / 重做', 'Ctrl + Z / Ctrl + Shift + Z'],
             ['保存 / 导出', 'Ctrl + S / Ctrl + Shift + S'],
             ['调整大小', '[ / ]'],

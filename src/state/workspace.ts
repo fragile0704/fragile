@@ -2,21 +2,8 @@ import { useEffect, useState, useSyncExternalStore } from 'react'
 import { Editor } from '../engine/editor'
 import { defaultBrush, presetSettings } from '../engine/brush'
 import { saveLocal, flushOnExit } from '../engine/files'
-import { clamp, type Brush, type Preset, type Tool } from '../engine/types'
-export interface View {
-  zoom: number
-  x: number
-  y: number
-  angle: number
-  flip: boolean
-}
-export const defaultView: View = {
-  zoom: 0.5,
-  x: 0,
-  y: 0,
-  angle: 0,
-  flip: false,
-}
+import { anchoredView, defaultView, type View } from '../engine/view'
+import { type Brush, type Preset, type Tool } from '../engine/types'
 export function useSaved<T>(key: string, fallback: T) {
   const [value, setValue] = useState<T>(() => {
     try {
@@ -132,7 +119,7 @@ export function useWorkspace(editor: Editor) {
   const chooseColor = (c: string) => setColor(c.toLowerCase())
   const fit = () => setFitKey((k) => k + 1)
   const zoom = (factor: number) =>
-    setView((v) => ({ ...v, zoom: clamp(v.zoom * factor, 0.1, 8) }))
+    setView((v) => anchoredView(v, v.zoom * factor, { x: 0, y: 0 }))
   return {
     editor,
     tool,
