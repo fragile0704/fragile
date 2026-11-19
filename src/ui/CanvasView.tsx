@@ -10,6 +10,7 @@ import {
 } from 'react'
 import {
   FileImage,
+  ChevronDown,
   Plus,
   Minus,
   Scan,
@@ -42,7 +43,15 @@ type Capture = {
   vy: number
   points: Point[]
 }
-export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
+export function CanvasView({
+  s,
+  onNew,
+  onViewSettings,
+}: {
+  s: Workspace
+  onNew: () => void
+  onViewSettings: () => void
+}) {
   const editor = s.editor,
     doc = editor.doc,
     v = s.view
@@ -58,7 +67,8 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
     space = useRef(false)
   const redrawSelection = useRef<() => void>(() => {})
   const touches = useRef(new TouchNavigation())
-  function fit() {
+  const fitted = useRef<typeof v | null>(null)
+  function fit(force: boolean) {
     const node = stage.current
     if (!node) return
     const w = node.clientWidth,
@@ -69,12 +79,17 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
         (h - 78) / current.current.editor.doc.height,
       ),
     )
-    current.current.setView({ zoom, x: 0, y: 0, angle: 0, flip: false })
+    const next = { zoom, x: 0, y: 0, angle: 0, flip: false }
+    const previousFit = fitted.current
+    fitted.current = next
+    current.current.setView((previous) =>
+      force || previous === previousFit ? next : { ...previous },
+    )
   }
   useLayoutEffect(() => {
-    const ro = new ResizeObserver(fit)
+    const ro = new ResizeObserver(() => fit(false))
     ro.observe(stage.current!)
-    fit()
+    fit(true)
     return () => ro.disconnect()
   }, [doc.width, doc.height, s.fitKey])
   useEffect(() => {
@@ -210,18 +225,21 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
       window.removeEventListener('blur', reset)
     }
   }, [editor])
-  function point(e: {
-    clientX: number
-    clientY: number
-    pressure: number
-    pointerType: string
-  }): Point {
-    const screen = stagePosition(stage.current!, e.clientX, e.clientY)
+  const angle = (v.angle * Math.PI) / 180,
+    cos = Math.cos(angle),
+    sin = Math.sin(angle)
+  function point(
+    e: {
+      clientX: number
+      clientY: number
+      pressure: number
+      pointerType: string
+    },
+    rect = stage.current!.getBoundingClientRect(),
+  ): Point {
+    const screen = stagePosition(rect, e.clientX, e.clientY)
     const dx = screen.x - v.x,
       dy = screen.y - v.y
-    const a = (v.angle * Math.PI) / 180,
-      cos = Math.cos(a),
-      sin = Math.sin(a)
     return {
       x: doc.width / 2 + ((dx * cos + dy * sin) / v.zoom) * (v.flip ? -1 : 1),
       y: doc.height / 2 + (-dx * sin + dy * cos) / v.zoom,
@@ -230,7 +248,11 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
   }
   function applyTap(tool: Tool, e: RPointer<HTMLDivElement>, p: Point) {
     if (tool === 'zoom') {
-      const anchor = stagePosition(e.currentTarget, e.clientX, e.clientY)
+      const anchor = stagePosition(
+        e.currentTarget.getBoundingClientRect(),
+        e.clientX,
+        e.clientY,
+      )
       s.setView((v) =>
         anchoredView(v, v.zoom * (e.altKey ? 0.8 : 1.25), anchor),
       )
@@ -264,7 +286,11 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
       if (cap.current && !touches.current.tracking) return
       touches.current.start(
         e.pointerId,
-        stagePosition(e.currentTarget, e.clientX, e.clientY),
+        stagePosition(
+          e.currentTarget.getBoundingClientRect(),
+          e.clientX,
+          e.clientY,
+        ),
         v,
       )
       e.currentTarget.setPointerCapture(e.pointerId)
@@ -335,18 +361,18 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
       )
   }
   function move(e: RPointer<HTMLDivElement>) {
+    const r = e.currentTarget.getBoundingClientRect()
     if (e.pointerType === 'touch') {
       const view = touches.current.move(
         e.pointerId,
-        stagePosition(e.currentTarget, e.clientX, e.clientY),
+        stagePosition(r, e.clientX, e.clientY),
       )
       if (view) {
         s.setView(view)
         return
       }
     }
-    const p = point(e),
-      r = e.currentTarget.getBoundingClientRect(),
+    const p = point(e, r),
       ring = cursor.current!
     ring.style.left = e.clientX - r.left + 'px'
     ring.style.top = e.clientY - r.top + 'px'
@@ -374,7 +400,7 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
       return
     }
     const events = e.nativeEvent.getCoalescedEvents?.() ?? []
-    if (events.length) for (const ev of events) editor.drag(point(ev))
+    if (events.length) for (const ev of events) editor.drag(point(ev, r))
     else editor.drag(p)
     g.last = p
   }
@@ -487,8 +513,13 @@ export function CanvasView({ s, onNew }: { s: Workspace; onNew: () => void }) {
             title="100% 显示"
             onClick={() => s.setView((v) => ({ ...v, zoom: 1, x: 0, y: 0 }))}
           >
-            {Math.round(v.zoom * 100)}%
+            {Number((v.zoom * 100).toFixed(1))}%
           </button>
+          <IconButton
+            icon={ChevronDown}
+            label="精确缩放"
+            onClick={onViewSettings}
+          />
           <IconButton
             icon={Plus}
             label="放大视图"

@@ -1,6 +1,11 @@
 import { test, expect, type Page } from '@playwright/test'
 import { readFile } from 'node:fs/promises'
 
+declare global {
+  interface Window {
+    atelierSaveMeter: { encodes: number; syncEncodes: number; writeMs: number }
+  }
+}
 async function fresh(page: Page, width = 240, height = 240) {
   await page.goto('./')
   await page.getByRole('button', { name: '新建画布', exact: true }).click()
@@ -78,6 +83,7 @@ async function project(page: Page) {
   return f
 }
 async function importFile(page: Page, buffer: Buffer) {
+  page.once('dialog', (dialog) => dialog.accept())
   await page.getByLabel('打开 Atelier 工程').setInputFiles({
     name: 'test.atelier',
     mimeType: 'application/json',
@@ -645,4 +651,258 @@ test.describe('触屏视图导航', () => {
     await expect(page.locator('.layer-row')).toHaveCount(1)
     await alpha(page, 50, 60, 255)
   })
+})
+
+test('精确缩放到 3199.5% 后调整面板仍保持比例，细笔落在指定像素', async ({
+  page,
+}) => {
+  await fresh(page)
+  await page.getByRole('button', { name: '精确缩放', exact: true }).click()
+  await page.getByLabel('缩放比例（%）').fill('3199.5')
+  await page.getByRole('button', { name: '完成', exact: true }).click()
+  await page.getByRole('button', { name: '切换专注模式' }).click()
+  await expect(page.locator('.zoom-label')).toHaveText('3199.5%')
+  await expect
+    .poll(
+      async () =>
+        (await page.getByTestId('artboard').boundingBox())!.width / 240,
+    )
+    .toBeCloseTo(31.995, 3)
+  for (let i = 0; i < 20; i++) await page.keyboard.press('[')
+  await stroke(page, 120.5, 119.5)
+  await expect
+    .poll(async () => (await pixel(page, 120, 119))[3])
+    .toBeGreaterThan(0)
+  await alpha(page, 121, 119, 0)
+  await page.keyboard.press('Control+z')
+  await alpha(page, 120, 119, 0)
+})
+
+test('关闭浏览器后重开及渲染进程意外退出后，恢复已提交到磁盘的分层工程', async ({
+  playwright,
+  baseURL,
+}, info) => {
+  const profile = info.outputPath('isolated-browser-profile')
+  const launch = () =>
+    playwright.chromium.launchPersistentContext(profile, {
+      ...info.project.use.launchOptions,
+      baseURL,
+      viewport: { width: 1280, height: 800 },
+    })
+  let browser = await launch()
+  try {
+    let page = browser.pages()[0]
+    await fresh(page, 280, 210)
+    await stroke(page, 45, 55)
+    await page.getByRole('button', { name: '新建图层', exact: true }).click()
+    await color(page, '#2186aa')
+    await stroke(page, 135, 125)
+    await page.getByLabel('图层不透明度').focus()
+    await page.keyboard.press('Home')
+    for (let i = 0; i < 5; i++) await page.keyboard.press('PageUp')
+    await page.locator('.stage').focus()
+    await saved(page)
+    const expected = JSON.parse((await project(page)).buffer.toString())
+    expect(expected.layers[1].opacity).toBe(0.5)
+    const rgba = await pixel(page, 135, 125)
+    await browser.close()
+    browser = await launch()
+    page = browser.pages()[0]
+    await page.goto('./')
+    await saved(page)
+    expect(await pixel(page, 135, 125)).toEqual(rgba)
+    expect(JSON.parse((await project(page)).buffer.toString())).toEqual(
+      expected,
+    )
+    await stroke(page, 165, 105)
+    await saved(page)
+    const latest = await pixel(page, 165, 105)
+    const cdp = await browser.newCDPSession(page)
+    const crashed = page.waitForEvent('crash')
+    void cdp.send('Page.crash').catch(() => {})
+    await crashed
+    const recovered = await browser.newPage()
+    await recovered.goto('./')
+    await saved(recovered)
+    expect(await pixel(recovered, 165, 105)).toEqual(latest)
+    expect(await pixel(recovered, 135, 125)).toEqual(rgba)
+  } finally {
+    await browser.close()
+  }
+})
+
+test('过期标签页不能覆盖另一页已保存的画作', async ({ page, context }) => {
+  await fresh(page)
+  const other = await context.newPage()
+  await other.goto('./')
+  await saved(other)
+  await stroke(page, 85, 95)
+  await saved(page)
+  await stroke(other, 170, 140)
+  await expect(
+    other.getByText('其他标签页已保存，请导出本页工程', { exact: true }),
+  ).toBeVisible()
+  expect((await project(other)).buffer.length).toBeGreaterThan(0)
+  await other.close()
+  await page.reload()
+  await saved(page)
+  await alpha(page, 85, 95, 255)
+  await alpha(page, 170, 140, 0)
+})
+
+test('旧版本本地工程升级后仍可编辑，损坏的记录保持原样', async ({ page }) => {
+  await fresh(page, 120, 100)
+  await stroke(page, 60, 40)
+  await saved(page)
+  const legacy = JSON.parse((await project(page)).buffer.toString())
+  const isolated = await page
+    .context()
+    .browser()!
+    .newContext({ baseURL: test.info().project.use.baseURL })
+  try {
+    const restored = await isolated.newPage()
+    // Seed a disposable v1 database before the application gets its first load.
+    await restored.goto('atelier.svg')
+    await restored.evaluate(
+      (data) =>
+        new Promise<void>((ok, no) => {
+          const req = indexedDB.open('atelier-workspace', 1)
+          req.onupgradeneeded = () => req.result.createObjectStore('projects')
+          req.onsuccess = () => {
+            const db = req.result
+            const tx = db.transaction('projects', 'readwrite')
+            tx.objectStore('projects').put(data, 'current')
+            tx.oncomplete = () => {
+              db.close()
+              ok()
+            }
+            tx.onerror = () => no(tx.error)
+          }
+        }),
+      legacy,
+    )
+    await restored.goto('./')
+    await saved(restored)
+    await alpha(restored, 60, 40, 255)
+    await stroke(restored, 80, 45)
+    await saved(restored)
+    await restored.reload()
+    await saved(restored)
+    await alpha(restored, 80, 45, 255)
+    // Only the test's private profile is modified here.
+    await restored.evaluate(
+      () =>
+        new Promise<void>((ok, no) => {
+          const req = indexedDB.open('atelier-workspace')
+          req.onsuccess = () => {
+            const db = req.result
+            const tx = db.transaction('projects', 'readwrite')
+            tx.objectStore('projects').put('test-unreadable-record', 'current')
+            tx.oncomplete = () => {
+              db.close()
+              ok()
+            }
+            tx.onerror = () => no(tx.error)
+          }
+        }),
+    )
+    await restored.reload()
+    await expect(
+      restored.getByText('读取本地工程失败，请导出工程', { exact: true }),
+    ).toBeVisible()
+    await restored.reload()
+    const raw = await restored.evaluate(
+      () =>
+        new Promise((ok) => {
+          const req = indexedDB.open('atelier-workspace')
+          req.onsuccess = () => {
+            const db = req.result
+            const get = db
+              .transaction('projects')
+              .objectStore('projects')
+              .get('current')
+            get.onsuccess = () => {
+              ok(get.result)
+              db.close()
+            }
+          }
+        }),
+    )
+    expect(raw).toBe('test-unreadable-record')
+  } finally {
+    await isolated.close()
+  }
+})
+
+test('导入确认取消保留原图，尺寸不匹配的图层在解码前被拒绝', async ({
+  page,
+}) => {
+  await fresh(page)
+  await stroke(page, 60, 60)
+  await saved(page)
+  const original = await project(page)
+  const open = (buffer: Buffer) =>
+    page.getByLabel('打开 Atelier 工程').setInputFiles({
+      name: 'sample.atelier',
+      mimeType: 'application/json',
+      buffer,
+    })
+  page.once('dialog', (d) => d.dismiss())
+  await open(original.buffer)
+  const mismatch = JSON.parse(original.buffer.toString())
+  mismatch.width++
+  await open(Buffer.from(JSON.stringify(mismatch)))
+  await expect(page.locator('.toast')).toContainText(
+    'PNG 图层头或像素尺寸与工程不一致',
+  )
+  await alpha(page, 60, 60, 255)
+  await expect(page.getByTestId('artboard')).toHaveAttribute('width', '240')
+})
+
+test('五层示例连续绘制时不逐点编码，保存仅编码变动图层', async ({
+  page,
+}, info) => {
+  await page.goto('./')
+  await saved(page)
+  const requests: string[] = []
+  page.on('request', (req) => requests.push(req.method()))
+  await page.evaluate(() => {
+    const meter = { encodes: 0, syncEncodes: 0, writeMs: 0 }
+    Object.assign(window, { atelierSaveMeter: meter })
+    const canvas = HTMLCanvasElement.prototype,
+      encode = canvas.toBlob,
+      sync = canvas.toDataURL
+    canvas.toBlob = function (...args) {
+      meter.encodes++
+      return encode.apply(this, args)
+    }
+    canvas.toDataURL = function (...args) {
+      meter.syncEncodes++
+      return sync.apply(this, args)
+    }
+    const put = IDBObjectStore.prototype.put
+    IDBObjectStore.prototype.put = function (...args) {
+      const t = performance.now()
+      const result = put.apply(this, args)
+      meter.writeMs = Math.max(meter.writeMs, performance.now() - t)
+      return result
+    }
+  })
+  const meter = () => page.evaluate(() => window.atelierSaveMeter)
+  const a = await position(page, 300, 300),
+    b = await position(page, 700, 720)
+  await page.mouse.move(a.x, a.y)
+  await page.mouse.down()
+  await page.mouse.move(b.x, b.y, { steps: 48 })
+  expect((await meter()).encodes).toBe(0)
+  await page.mouse.up()
+  await saved(page)
+  const result = await meter()
+  expect(result).toMatchObject({ encodes: 1, syncEncodes: 0 })
+  expect(requests.filter((method) => method !== 'GET')).toEqual([])
+  await info.attach('save-timing', {
+    body: JSON.stringify(result),
+    contentType: 'application/json',
+  })
+  console.log('五层示例自动保存测量', result)
 })

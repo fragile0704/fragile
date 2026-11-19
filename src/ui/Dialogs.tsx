@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Download, FileImage, Layers, Check } from 'lucide-react'
 import { Modal, toolInfo } from './common'
+import { anchoredView } from '../engine/view'
 import { blank } from '../engine/types'
 import { exportImage, exportProject } from '../engine/files'
 import type { Workspace } from '../state/workspace'
@@ -20,6 +21,9 @@ export function Dialogs({
     [width, setWidth] = useState('1600'),
     [height, setHeight] = useState('1200'),
     [transparent, setTransparent] = useState(true)
+  const [zoomPercent, setZoomPercent] = useState(
+    String(Number((s.view.zoom * 100).toFixed(2))),
+  )
   const [format, setFormat] = useState<'png' | 'jpeg' | 'atelier'>('png'),
     [busy, setBusy] = useState(false),
     [error, setError] = useState('')
@@ -212,7 +216,30 @@ export function Dialogs({
   if (kind === 'view')
     return (
       <Modal title="画布显示" close={close}>
-        <div className="dialog-body">
+        <form
+          className="dialog-body"
+          onSubmit={(event) => {
+            event.preventDefault()
+            s.setView((view) =>
+              anchoredView(view, Number(zoomPercent) / 100, { x: 0, y: 0 }),
+            )
+            close()
+          }}
+        >
+          <label>
+            缩放比例（%）
+            <input
+              autoFocus
+              type="number"
+              min="5"
+              max="3200"
+              step="any"
+              required
+              value={zoomPercent}
+              onFocus={(event) => event.target.select()}
+              onChange={(event) => setZoomPercent(event.target.value)}
+            />
+          </label>
           <label>
             透明区域显示
             <select
@@ -251,11 +278,11 @@ export function Dialogs({
             />
           </label>
           <footer>
-            <button className="primary" onClick={close}>
+            <button className="primary" type="submit">
               完成
             </button>
           </footer>
-        </div>
+        </form>
       </Modal>
     )
   return null

@@ -3,6 +3,7 @@ import {
   blendNames,
   context,
   makeLayer,
+  layerId,
   roomForLayer,
   surface,
   type Blend,
@@ -63,6 +64,26 @@ export async function pack(doc: Painting) {
   )
   return projectRecord(doc, layers)
 }
+// Inspect the fixed-size PNG header before the browser allocates a decoder.
+function verifyPng(png: string, width: number, height: number) {
+  const prefix = 'data:image/png;base64,'
+  if (!png.startsWith(prefix)) throw Error('仅支持嵌入式 PNG 图层')
+  const bytes = Uint8Array.from(
+    atob(png.slice(prefix.length, prefix.length + 32)),
+    (ch) => ch.charCodeAt(0),
+  )
+  const header = new DataView(bytes.buffer)
+  if (
+    bytes.length !== 24 ||
+    header.getUint32(0) !== 0x89504e47 ||
+    header.getUint32(4) !== 0x0d0a1a0a ||
+    header.getUint32(8) !== 13 ||
+    header.getUint32(12) !== 0x49484452 ||
+    header.getUint32(16) !== width ||
+    header.getUint32(20) !== height
+  )
+    throw Error('PNG 图层头或像素尺寸与工程不一致')
+}
 export async function unpack(input: unknown): Promise<Painting> {
   if (!input || typeof input !== 'object') throw Error('无效的 Atelier 工程')
   const f = input as Awaited<ReturnType<typeof pack>>
@@ -74,6 +95,11 @@ export async function unpack(input: unknown): Promise<Painting> {
     !f.layers.length
   )
     throw Error('无法识别工程格式或版本')
+  if (
+    f.layers.length > 64 ||
+    f.width * f.height * f.layers.length > 64 * 1024 * 1024
+  )
+    throw Error('工程超过图层内存上限')
   const doc = blank(f.width, f.height, f.name)
   doc.layers = []
   for (const l of f.layers) {
@@ -92,6 +118,7 @@ export async function unpack(input: unknown): Promise<Painting> {
       !l.png.startsWith('data:image/png;base64,')
     )
       throw Error('工程的图层数据无效')
+    verifyPng(l.png, f.width, f.height)
     const image = new Image()
     image.src = l.png
     await image.decode()
@@ -120,44 +147,82 @@ let connection: IDBDatabase | undefined
 let dbPromise: Promise<IDBDatabase> | undefined
 function database() {
   return (dbPromise ??= new Promise((resolve, reject) => {
-    const req = indexedDB.open('atelier-workspace', 1)
-    req.onupgradeneeded = () => req.result.createObjectStore('projects')
+    let blocked = false
+    const req = indexedDB.open('atelier-workspace', 2)
+    req.onblocked = () => {
+      blocked = true
+      reject(Error('请先关闭其他 Atelier 标签页，再重新打开'))
+    }
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains('projects'))
+        req.result.createObjectStore('projects')
+      const heads = req.result.createObjectStore('save-head', {
+        keyPath: 'revision',
+      })
+      heads.createIndex('slot', 'slot', { unique: true })
+      heads.add({ slot: 'current', revision: 'initial' })
+    }
     req.onsuccess = () => {
+      if (blocked) {
+        req.result.close()
+        return
+      }
       connection = req.result
+      connection.onversionchange = () => {
+        readOnlyReason = '存储版本已更新，请导出工程并重新打开'
+        req.result.close()
+      }
+
       resolve(req.result)
     }
     req.onerror = () => reject(req.error)
   }))
 }
-let preserveOnNextSave = false
+let readOnlyReason = '读取本地工程失败，请导出工程'
+let revision: string | undefined
+const session = layerId()
+export function localSaveIssue() {
+  return readOnlyReason
+}
 let durable: Painting | undefined
 let writer = 0
 let pendingWrite = false
 function storeProject(db: IDBDatabase, data: ReturnType<typeof projectRecord>) {
   return new Promise<void>((ok, no) => {
-    const tx = db.transaction('projects', 'readwrite')
-    const store = tx.objectStore('projects')
-    if (preserveOnNextSave) {
-      const previous = store.get('current')
-      previous.onsuccess = () => {
-        if (previous.result !== undefined)
-          store.put(previous.result, 'recovery')
-        store.put(data, 'current')
-        tx.commit?.()
-      }
-    } else {
-      store.put(data, 'current')
+    if (readOnlyReason) {
+      no(Error(readOnlyReason))
+      return
+    }
+    const expected = revision!
+    const next = session + '/' + writer
+    const tx = db.transaction(['projects', 'save-head'], 'readwrite', {
+      durability: 'strict',
+    })
+    // The unique slot makes replacing a stale revision fail atomically. All
+    // requests can be queued synchronously, including during pagehide.
+    const heads = tx.objectStore('save-head')
+    try {
+      heads.delete(expected)
+      heads.add({ slot: 'current', revision: next })
+      tx.objectStore('projects').put(data, 'current')
       tx.commit?.()
+    } catch (error) {
+      tx.abort()
+      no(error)
+      return
     }
-    tx.oncomplete = () => {
-      preserveOnNextSave = false
-      ok()
+    revision = next
+    tx.oncomplete = () => ok()
+    tx.onabort = () => {
+      if (revision === next) revision = expected
+      if (tx.error?.name === 'ConstraintError')
+        readOnlyReason = '其他标签页已保存，请导出本页工程'
+      no(Error(readOnlyReason || '本地写入失败'))
     }
-    tx.onerror = () => no(tx.error)
-    tx.onabort = () => no(tx.error)
   })
 }
 export async function saveLocal(doc: Painting) {
+  if (readOnlyReason) throw Error(readOnlyReason)
   if (durable === doc && !pendingWrite) return
   const ticket = ++writer
   pendingWrite = true
@@ -174,7 +239,8 @@ export async function saveLocal(doc: Painting) {
 // A page can disappear before an asynchronous PNG encode finishes. Queue and
 // commit the current record during pagehide, reusing previously encoded layers.
 export function flushOnExit(doc: Painting) {
-  if (!connection || (durable === doc && !pendingWrite)) return
+  if (readOnlyReason || !connection || (durable === doc && !pendingWrite))
+    return
   const layers = doc.layers.map(({ pixels, ...meta }) => ({
     ...meta,
     png: cachedPng.get(pixels) ?? pixels.toDataURL('image/png'),
@@ -194,29 +260,35 @@ export function flushOnExit(doc: Painting) {
   )
 }
 export async function restore() {
-  const db = await database(),
-    data = await new Promise<unknown>((ok, no) => {
-      const req = db
-        .transaction('projects')
-        .objectStore('projects')
-        .get('current')
-      req.onsuccess = () => ok(req.result)
-      req.onerror = () => no(req.error)
-    })
-  try {
-    if (!data) return null
-    durable = await unpack(data)
-    return durable
-  } catch (err) {
-    preserveOnNextSave = true
-    throw err
-  }
+  const db = await database()
+  const data = await new Promise<unknown>((ok, no) => {
+    const tx = db.transaction(['projects', 'save-head']),
+      store = tx.objectStore('projects')
+    const current = store.get('current'),
+      head = tx.objectStore('save-head').index('slot').get('current')
+    tx.oncomplete = () => {
+      if (typeof head.result?.revision !== 'string') {
+        no(Error('无法读取本地保存版本'))
+        return
+      }
+      revision = head.result.revision
+      ok(current.result)
+    }
+    tx.onabort = () => no(tx.error)
+    tx.onerror = () => no(tx.error)
+  })
+  durable = data === undefined ? undefined : await unpack(data)
+  readOnlyReason = ''
+  return durable ?? null
 }
 export function download(blob: Blob, name: string) {
   const url = URL.createObjectURL(blob),
     a = document.createElement('a')
   a.href = url
-  a.download = name
+  a.download = name.replace(
+    /[<>:"/\\|?*\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g,
+    '_',
+  )
   a.click()
   setTimeout(() => URL.revokeObjectURL(url), 2000)
 }

@@ -6,11 +6,10 @@ import {
 } from '../engine/view'
 
 export function stagePosition(
-  node: HTMLElement,
+  r: DOMRectReadOnly,
   clientX: number,
   clientY: number,
 ): Position {
-  const r = node.getBoundingClientRect()
   return {
     x: clientX - r.left - r.width / 2,
     y: clientY - r.top - r.height / 2 + 18,
@@ -112,7 +111,11 @@ export function wheelNavigation(
       })
       return
     }
-    anchor = stagePosition(node, event.clientX, event.clientY)
+    anchor = stagePosition(
+      node.getBoundingClientRect(),
+      event.clientX,
+      event.clientY,
+    )
     target = limitZoom(
       (frame ? target : current.zoom) * Math.exp(-event.deltaY * unit * 0.0025),
     )

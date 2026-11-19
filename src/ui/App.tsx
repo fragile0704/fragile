@@ -25,6 +25,9 @@ import { LayerPanel } from './LayerPanel'
 import { Rail, Options } from './Tools'
 import { Dialogs, type DialogName } from './Dialogs'
 import { useShortcuts } from './shortcuts'
+const studioIcon =
+  document.querySelector<HTMLLinkElement>('link[rel="icon"]')?.href ??
+  import.meta.env.BASE_URL + 'atelier.svg'
 type Item = [string, () => void, string?, boolean?]
 export function App({
   editor,
@@ -113,7 +116,7 @@ export function App({
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <img src={import.meta.env.BASE_URL + 'atelier.svg'} alt="" />
+          <img src={studioIcon} alt="" />
           <span>Atelier</span>
         </div>
         <i className="vr" />
@@ -180,12 +183,12 @@ export function App({
           <i className="vr" />
           <span
             className={
-              'save-state ' + (s.saveState.includes('失败') ? 'failed' : '')
+              'save-state ' + (s.saveState !== '正在保存' ? 'failed' : '')
             }
           >
             {s.saveState === '已保存到本地' ? (
               <CheckCheck />
-            ) : s.saveState.includes('失败') ? (
+            ) : s.saveState !== '正在保存' ? (
               <AlertCircle />
             ) : (
               <LoaderCircle />
@@ -212,6 +215,14 @@ export function App({
           try {
             if (f.size > 384 * 1024 * 1024) throw Error('工程文件过大')
             const doc = await unpack(JSON.parse(await f.text()))
+            if (
+              !window.confirm(
+                '打开「' +
+                  doc.name +
+                  '」将替换当前工作区和本地自动保存。确认打开？',
+              )
+            )
+              return
             editor.install(doc)
             s.fit()
             s.setToast('已打开 ' + doc.name)
@@ -224,7 +235,11 @@ export function App({
       <div className={'workspace ' + (!s.panels ? 'focus-mode' : '')}>
         <Rail s={s} />
         {s.panels && <BrushPanel s={s} />}
-        <CanvasView s={s} onNew={cmd.fresh} />
+        <CanvasView
+          s={s}
+          onNew={cmd.fresh}
+          onViewSettings={() => openDialog('view')}
+        />
         {s.panels && (
           <aside className="inspector panel">
             <ColorPanel s={s} />
